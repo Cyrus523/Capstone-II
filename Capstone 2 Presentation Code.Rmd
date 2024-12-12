@@ -1,0 +1,847 @@
+---
+title: "Capstone 2 Presentation Code"
+author: "Cyrus"
+date: "2024-12-12"
+output: html_document
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "Contents"
+execute:
+  warning: false
+  message: false
+  error: false
+  output: true
+  max-lines: 10
+---
+
+# Data Loading and Cleaning
+
+```{r, warning=FALSE, message=FALSE, results='hide'}
+
+library(tidyverse)
+library(skimr)
+library(summarytools)
+library(janitor)
+library(caret)
+library(kernlab)
+library(rminer)
+library(randomForest)
+library(xgboost)
+library(pROC)
+
+# change names and csv names as needed
+ApplicationTrain <- read.csv("/Users/cyrussobhani/Documents/Capstone II/home-credit-default-risk/application_train.csv")
+ApplicationTest <- read.csv("/Users/cyrussobhani/Documents/Capstone II/home-credit-default-risk/application_test.csv")
+Bureau <- read.csv("/Users/cyrussobhani/Documents/Capstone II/home-credit-default-risk/bureau.csv")
+
+```
+
+## Cleaning the Bureau Table
+
+```{r}
+
+bureau <- clean_names(Bureau)
+bureau$credit_active <- as.factor(bureau$credit_active)
+bureau$credit_type <- as.factor(bureau$credit_type)
+bureau <- clean_names(bureau)
+
+bureau_agg <- bureau %>%
+  group_by(sk_id_curr) %>%
+  summarise(
+    total_past_due = sum(amt_credit_sum_overdue, na.rm = TRUE),  # Sum of past due amounts
+    number_of_accounts = n(),  # Count of rows per sk_id_curr
+    number_of_paid_accounts = sum(credit_active == 'Closed' & (is.na(amt_credit_sum_debt) | amt_credit_sum_debt == 0)),  # Count of paid off accounts
+    ct_mortgage_auto = sum(credit_type %in% c('Car loan', 'Mortgage', 'Real estate loan')),  # Count of mortgage and auto-related credit types
+    ct_chargoff_accts = sum(credit_active == 'Closed' & amt_credit_sum_debt > 0, na.rm = TRUE),  # Count of charge-off accounts
+    sum_chargoff_balance = sum(ifelse(credit_active == 'Closed' & amt_credit_sum_debt > 0, amt_credit_sum_debt, 0), na.rm = TRUE),  # Sum of charge-off balances
+    ct_paid_mortgage_auto = sum(credit_active == 'Closed' & (is.na(amt_credit_sum_debt) | amt_credit_sum_debt == 0) &
+                                credit_type %in% c('Car loan', 'Mortgage', 'Real estate loan'))  # Count of paid off mortgage/auto-related accounts
+  )
+
+```
+
+## Cleaning the training set
+
+```{r}
+
+# Factoring all character variables
+at_clean <- ApplicationTrain %>%
+  mutate(across(where(is.character), as.factor))
+
+#Factoring all 'flag' varaibles
+at_clean <- at_clean %>%
+  mutate(across(matches("flag", ignore.case = TRUE), as.factor))
+
+# Factoring all binary numeric variables
+at_clean <- at_clean %>%
+  mutate(across(c(REG_REGION_NOT_LIVE_REGION,
+                  REG_REGION_NOT_WORK_REGION,
+                  LIVE_REGION_NOT_WORK_REGION,
+                  REG_CITY_NOT_LIVE_CITY,
+                  REG_CITY_NOT_WORK_CITY,
+                  LIVE_CITY_NOT_WORK_CITY,
+                  TARGET), as.factor))
+
+# Converting column names to lowercase
+at_clean <- at_clean %>% clean_names()
+
+# Defining all living situation variables that are unnecessary for modeling
+living_situation_vars <- c(
+  "apartments_avg", "basementarea_avg", "years_beginexpluatation_avg",
+  "years_build_avg", "commonarea_avg", "elevators_avg",
+  "entrances_avg", "floorsmax_avg", "floorsmin_avg",
+  "landarea_avg", "livingapartments_avg", "livingarea_avg",
+  "nonlivingapartments_avg", "nonlivingarea_avg", "apartments_mode",
+  "basementarea_mode", "years_beginexpluatation_mode", "years_build_mode",
+  "commonarea_mode", "elevators_mode", "entrances_mode",
+  "floorsmax_mode", "floorsmin_mode", "landarea_mode",
+  "livingapartments_mode", "livingarea_mode", "nonlivingapartments_mode",
+  "nonlivingarea_mode", "apartments_medi", "basementarea_medi",
+  "years_beginexpluatation_medi", "years_build_medi", "commonarea_medi",
+  "elevators_medi", "entrances_medi", "floorsmax_medi",
+  "floorsmin_medi", "landarea_medi", "livingapartments_medi",
+  "livingarea_medi", "nonlivingapartments_medi", "nonlivingarea_medi",  "totalarea_mode"
+)
+
+# Removing all living situation variables and a few others not defined before
+at_clean <- at_clean %>%
+  select(-all_of(living_situation_vars),
+         -fondkapremont_mode,
+         -housetype_mode,
+         -wallsmaterial_mode,
+         -emergencystate_mode)
+
+# Fixing the issues with days employed variable
+at_clean <- at_clean %>%
+  mutate(days_employed = ifelse(days_employed > 0, 0, days_employed))
+
+at_clean <- at_clean %>%
+  mutate(days_employed = abs(days_employed))
+
+# Simplifying the Occupation type variable
+at_clean <- at_clean %>%
+  mutate(occupation_type = case_when(
+    is.na(occupation_type) & days_employed > 0 ~ 'Not listed',
+    is.na(occupation_type) & days_employed == 0 ~ 'Unemployed',
+    TRUE ~ occupation_type  # Keep original value if not NA
+  )) %>% mutate(occupation_type = factor(occupation_type))
+
+# Removing all rows where name_type_suite is n/a
+at_clean <- at_clean %>%
+  filter(!is.na(name_type_suite))
+
+# Combining credit scores to an average credit score
+at_clean <- at_clean %>%
+  mutate(avg_credit_score = rowMeans(
+    select(., ext_source_1, ext_source_2, ext_source_3),
+    na.rm = TRUE
+  )) %>%
+  mutate(avg_credit_score = ifelse(is.na(avg_credit_score), 0, avg_credit_score))
+
+# Creating credit flags based on how many bureau credit scores are available
+at_clean <- at_clean %>%
+  mutate(
+    limited_credit_flag = case_when(
+      rowSums(!is.na(select(., ext_source_1, ext_source_2, ext_source_3))) %in% 1:2 ~ 1,
+      TRUE ~ 0
+    ),
+    no_credit_flag = case_when(
+      rowSums(is.na(select(., ext_source_1, ext_source_2, ext_source_3))) == 3 ~ 1,
+      TRUE ~ 0
+    ),
+    full_credit_flag = case_when(
+      rowSums(!is.na(select(., ext_source_1, ext_source_2, ext_source_3))) == 3 ~ 1,
+      TRUE ~ 0
+    )
+  ) %>%
+  mutate(
+    limited_credit_flag = factor(limited_credit_flag),
+    no_credit_flag = factor(no_credit_flag),
+    full_credit_flag = factor(full_credit_flag)
+  ) %>%
+  select(-ext_source_1, -ext_source_2, -ext_source_3)
+
+# Simplifying the own car age variable
+at_clean <- at_clean %>%
+  mutate(own_car_age = case_when(
+    is.na(own_car_age) ~ 'No car',
+    own_car_age >= 10 ~ '10+ years',
+    own_car_age < 10 ~ 'Less than 10 years'
+  )) %>%
+  mutate(own_car_age = as.factor(own_car_age))
+
+# Replacing n/a's with 0
+at_clean <- at_clean %>%
+  mutate(
+    amt_req_credit_bureau_hour = replace_na(amt_req_credit_bureau_hour, 0),
+    amt_req_credit_bureau_day = replace_na(amt_req_credit_bureau_day, 0),
+    amt_req_credit_bureau_week = replace_na(amt_req_credit_bureau_week, 0),
+    amt_req_credit_bureau_mon = replace_na(amt_req_credit_bureau_mon, 0),
+    amt_req_credit_bureau_qrt = replace_na(amt_req_credit_bureau_qrt, 0),
+    amt_req_credit_bureau_year = replace_na(amt_req_credit_bureau_year, 0)
+  )
+
+# Removing all rows where the following variables are n/a
+at_clean <- at_clean %>%
+  filter(
+    !is.na(amt_annuity) &
+    !is.na(obs_30_cnt_social_circle) &
+    !is.na(def_30_cnt_social_circle) &
+    !is.na(obs_60_cnt_social_circle) &
+    !is.na(def_60_cnt_social_circle) &
+    !is.na(days_last_phone_change)
+  )
+
+```
+
+## Joining the Bureau Table onto the training set
+
+```{r}
+
+at_join <- at_clean %>%
+  left_join(bureau_agg, by = "sk_id_curr")
+
+
+# converting NA's to 0's
+at_join <- at_join %>%
+  mutate(
+    total_past_due = replace_na(total_past_due, 0),
+    number_of_accounts = replace_na(number_of_accounts, 0),
+    number_of_paid_accounts = replace_na(number_of_paid_accounts, 0),
+    ct_mortgage_auto = replace_na(ct_mortgage_auto, 0),
+    ct_chargoff_accts = replace_na(ct_chargoff_accts, 0),
+    sum_chargoff_balance = replace_na(sum_chargoff_balance, 0),
+    ct_paid_mortgage_auto = replace_na(ct_paid_mortgage_auto, 0)
+  )
+
+```
+
+## Remove flags from the joined training set
+
+```{r}
+
+#Remove all flag_document variables
+at_join <- at_join %>%
+  select(-starts_with("flag_document"))
+
+# Convert negative values to postiive
+at_join <- at_join %>%
+  mutate(
+    days_birth = abs(days_birth),
+    days_registration = abs(days_registration),
+    days_id_publish = abs(days_id_publish),
+    days_last_phone_change = abs(days_last_phone_change)
+  )
+
+# Create application type based on name_type_suite
+at_join <- at_join %>%
+  mutate(application_type = factor(ifelse(name_type_suite == "Unaccompanied", "Individual", "Co-applied"))) %>%
+  select(-name_type_suite, -organization_type)
+
+```
+
+## Cleaning the testing set
+
+```{r}
+
+# Factoring all character variables
+at_cleanTest <- ApplicationTest %>%
+  mutate(across(where(is.character), as.factor))
+
+#Factoring all 'flag' variables
+at_cleanTest <- at_cleanTest %>%
+  mutate(across(matches("flag", ignore.case = TRUE), as.factor))
+
+# Factoring all binary numeric variables
+at_cleanTest <- at_cleanTest %>%
+  mutate(across(c(REG_REGION_NOT_LIVE_REGION,
+                  REG_REGION_NOT_WORK_REGION,
+                  LIVE_REGION_NOT_WORK_REGION,
+                  REG_CITY_NOT_LIVE_CITY,
+                  REG_CITY_NOT_WORK_CITY,
+                  LIVE_CITY_NOT_WORK_CITY), as.factor))
+
+# Converting column names to lowercase
+at_cleanTest <- at_cleanTest %>% clean_names()
+
+# Defining all living situation variables that are unnecessary for modeling
+living_situation_vars <- c(
+  "apartments_avg", "basementarea_avg", "years_beginexpluatation_avg",
+  "years_build_avg", "commonarea_avg", "elevators_avg",
+  "entrances_avg", "floorsmax_avg", "floorsmin_avg",
+  "landarea_avg", "livingapartments_avg", "livingarea_avg",
+  "nonlivingapartments_avg", "nonlivingarea_avg", "apartments_mode",
+  "basementarea_mode", "years_beginexpluatation_mode", "years_build_mode",
+  "commonarea_mode", "elevators_mode", "entrances_mode",
+  "floorsmax_mode", "floorsmin_mode", "landarea_mode",
+  "livingapartments_mode", "livingarea_mode", "nonlivingapartments_mode",
+  "nonlivingarea_mode", "apartments_medi", "basementarea_medi",
+  "years_beginexpluatation_medi", "years_build_medi", "commonarea_medi",
+  "elevators_medi", "entrances_medi", "floorsmax_medi",
+  "floorsmin_medi", "landarea_medi", "livingapartments_medi",
+  "livingarea_medi", "nonlivingapartments_medi", "nonlivingarea_medi",  "totalarea_mode"
+)
+
+# Removing all living situation variables and a few others not defined before
+at_cleanTest <- at_cleanTest %>%
+  select(-all_of(living_situation_vars),
+         -fondkapremont_mode,
+         -housetype_mode,
+         -wallsmaterial_mode,
+         -emergencystate_mode)
+
+# Fixing the issues with days employed variable
+at_cleanTest <- at_cleanTest %>%
+  mutate(days_employed = ifelse(days_employed > 0, 0, days_employed))
+
+at_cleanTest <- at_cleanTest %>%
+  mutate(days_employed = abs(days_employed))
+
+# Simplifying the Occupation type variable
+at_cleanTest <- at_cleanTest %>%
+  mutate(occupation_type = case_when(
+    is.na(occupation_type) & days_employed > 0 ~ 'Not listed',
+    is.na(occupation_type) & days_employed == 0 ~ 'Unemployed',
+    TRUE ~ occupation_type  # Keep original value if not NA
+  )) %>% mutate(occupation_type = factor(occupation_type))
+
+# Removing all rows where name_type_suite is n/a
+#at_cleanTest <- at_cleanTest %>%
+#  filter(!is.na(name_type_suite))
+
+# Combining credit scores to an average credit score
+at_cleanTest <- at_cleanTest %>%
+  mutate(avg_credit_score = rowMeans(
+    select(., ext_source_1, ext_source_2, ext_source_3),
+    na.rm = TRUE
+  )) %>%
+  mutate(avg_credit_score = ifelse(is.na(avg_credit_score), 0, avg_credit_score))
+
+# Creating credit flags based on how many bureau credit scores are available
+at_cleanTest <- at_cleanTest %>%
+  mutate(
+    limited_credit_flag = case_when(
+      rowSums(!is.na(select(., ext_source_1, ext_source_2, ext_source_3))) %in% 1:2 ~ 1,
+      TRUE ~ 0
+    ),
+    no_credit_flag = case_when(
+      rowSums(is.na(select(., ext_source_1, ext_source_2, ext_source_3))) == 3 ~ 1,
+      TRUE ~ 0
+    ),
+    full_credit_flag = case_when(
+      rowSums(!is.na(select(., ext_source_1, ext_source_2, ext_source_3))) == 3 ~ 1,
+      TRUE ~ 0
+    )
+  ) %>%
+  mutate(
+    limited_credit_flag = factor(limited_credit_flag),
+    no_credit_flag = factor(no_credit_flag),
+    full_credit_flag = factor(full_credit_flag)
+  ) %>%
+  select(-ext_source_1, -ext_source_2, -ext_source_3)
+
+# Simplifying the own car age variable
+at_cleanTest <- at_cleanTest %>%
+  mutate(own_car_age = case_when(
+    is.na(own_car_age) ~ 'No car',
+    own_car_age >= 10 ~ '10+ years',
+    own_car_age < 10 ~ 'Less than 10 years'
+  )) %>%
+  mutate(own_car_age = as.factor(own_car_age))
+
+# Replacing n/a's with 0
+at_cleanTest <- at_cleanTest %>%
+  mutate(
+    amt_req_credit_bureau_hour = replace_na(amt_req_credit_bureau_hour, 0),
+    amt_req_credit_bureau_day = replace_na(amt_req_credit_bureau_day, 0),
+    amt_req_credit_bureau_week = replace_na(amt_req_credit_bureau_week, 0),
+    amt_req_credit_bureau_mon = replace_na(amt_req_credit_bureau_mon, 0),
+    amt_req_credit_bureau_qrt = replace_na(amt_req_credit_bureau_qrt, 0),
+    amt_req_credit_bureau_year = replace_na(amt_req_credit_bureau_year, 0)
+  )
+
+# Removing all rows where the following variables are n/a
+#at_cleanTest <- at_cleanTest %>%
+#  filter(
+#    !is.na(amt_annuity) &
+#    !is.na(obs_30_cnt_social_circle) &
+#    !is.na(def_30_cnt_social_circle) &
+#    !is.na(obs_60_cnt_social_circle) &
+#    !is.na(def_60_cnt_social_circle) &
+#    !is.na(days_last_phone_change)
+#  )
+
+```
+
+## Joining the Bureau Table onto the testing set
+
+```{r}
+
+at_joinTest <- at_cleanTest %>%
+  left_join(bureau_agg, by = "sk_id_curr")
+
+
+# converting NA's to 0's
+at_joinTest <- at_joinTest %>%
+  mutate(
+    total_past_due = replace_na(total_past_due, 0),
+    number_of_accounts = replace_na(number_of_accounts, 0),
+    number_of_paid_accounts = replace_na(number_of_paid_accounts, 0),
+    ct_mortgage_auto = replace_na(ct_mortgage_auto, 0),
+    ct_chargoff_accts = replace_na(ct_chargoff_accts, 0),
+    sum_chargoff_balance = replace_na(sum_chargoff_balance, 0),
+    ct_paid_mortgage_auto = replace_na(ct_paid_mortgage_auto, 0)
+  )
+
+```
+
+## Remove flags from the joined testing set
+
+```{r}
+
+#Remove all flag_document variables
+at_joinTest <- at_joinTest %>%
+  select(-starts_with("flag_document"))
+
+# Convert negative values to postiive
+at_joinTest <- at_joinTest %>%
+  mutate(
+    days_birth = abs(days_birth),
+    days_registration = abs(days_registration),
+    days_id_publish = abs(days_id_publish),
+    days_last_phone_change = abs(days_last_phone_change)
+  )
+
+# Create application type based on name_type_suite
+at_joinTest <- at_joinTest %>%
+  mutate(application_type = factor(ifelse(name_type_suite == "Unaccompanied", "Individual", "Co-applied"))) %>%
+  select(-name_type_suite, -organization_type)
+
+```
+
+# Train and test the "clean" MLP model
+
+## Load relevant libraries
+
+```{r}
+
+library(dplyr)
+library(caret)  
+library(RWeka)  
+library(rminer)  
+library(matrixStats)  
+library(knitr)  
+library(kernlab)  
+library(tictoc)  
+library(tidyverse)
+
+```
+
+## Inspect the data
+
+NOTES: There is a significant class imbalance. The Target variable has a majority class weighting of 92%, with the subsequent minority class at 8%. The majority and minority classes are non-difficulties with payment ("non-default") and difficulties with payment ("default"), respectively.
+
+```{r}
+# find out how the target variable distribution
+DefaultCount <- sum(at_join$target == 1)
+DefaultCount
+NonDefaultCount <- sum(at_join$target == 0)
+NonDefaultCount
+
+PercentDefault <- DefaultCount/(DefaultCount+NonDefaultCount)
+PercentDefault*100
+```
+
+## Bagging Step for MLP Ensemble Trained on Clean data
+
+NOTES: We will use an 11-model ensemble for the MLP modeling. This is because the output needs to be a percentage, and the 11th model will essentially work as a "tie-breaker" in instances where 50% of the models are predicting discrete results. In the following code chunk we define the size of each bag by the size of the minority class, multiplied by 2. We then randomly sample the entire dataset for both classes in a 50/50 split to produce each bag.
+
+```{r}
+set.seed(123)
+
+NumberOfSamples <- 11
+
+# Used the entire size of the minority class
+SamplesPerClass <- min(table(at_join$target))
+
+NonDefultClass0 <- at_join[at_join$target == 0, ]
+DefaultClass1 <- at_join[at_join$target == 1, ]
+
+BSDatasets <- list()
+
+for (i in 1:NumberOfSamples) {
+  # Sample from each class with replacement
+  boot0 <- NonDefultClass0[sample(1:nrow(NonDefultClass0), SamplesPerClass, replace = TRUE), ]
+  boot1 <- DefaultClass1[sample(1:nrow(DefaultClass1), SamplesPerClass, replace = TRUE), ]
+  
+  # Combine the bootstrapped samples from each class
+  BSDatasets[[i]] <- rbind(boot1, boot0)
+}
+
+# Print the first bootstrapped dataset as an example to test if the bag was generated properly.
+SampleFromList <- BSDatasets[[1]]
+head(SampleFromList)
+```
+
+## Training the Ensemble Trained on Clean data
+
+NOTES: Here we train each MLP model on its corresponding bag, thus creating 11 different models trained on various randomized subsets of the data with 50/50 weighting of the target variable. For the sake of time in training the models and predicting on them, hyperparameter tuning was decided to be a manual process. This process aimed at creating models that were quick to train and debug, but still had satisfactory accuracy rates. The hyperparameters chosen in the following models are a result of the manual hyperparameter tuning process.
+
+```{r}
+
+# set seed for reproducibility
+set.seed(123) 
+
+#Build the hyperparameters for the MLP model. Changed learning rate to 0.5 from the default of 0.3 to run faster, number of Epochs to 100 (again to train faster), and the structure to 3,3,3.
+l <- 0.5 
+m <- 0.2 
+n <-100 
+h <- "3,3,3" 
+
+MLP <- make_Weka_classifier("weka/classifiers/functions/MultilayerPerceptron") 
+
+# Train an MLP model on each bootstrapped dataset
+Models <- list()
+for(i in 1:NumberOfSamples){
+  CurrentData <- BSDatasets[[i]]
+  TrainInput <- CurrentData[, -2]
+  TargetInput <- CurrentData[, 2] 
+  
+  MLPModel <- MLP(TargetInput~ .,data = TrainInput,control = Weka_control(L=l,M=m, N=n,H=h))
+  Models[[i]] <- MLPModel
+}
+
+```
+
+## Predict on the training data Trained on Clean data
+
+NOTES:
+
+```{r}
+
+# Define the metrics used to assess model quality
+ConfMatrix <- c("CONF")
+AllMetrics <- c("ALL")
+
+# Create the predictions vector for confusion matrix
+FinalPredictions <- matrix(0, nrow = 306000, ncol = 11)
+
+# Split the training and testing sets
+TestingSetForCurrent <- at_join[,-2]
+TestResultsForCurrent <- at_join[, 2]
+
+TestRowsBack <- 1 
+TestRowsFront <- 1000 
+
+AccuracyRates <- c()
+
+result_matrix <- matrix(ncol = 11, nrow = 0)
+
+for(i in 1:NumberOfSamples){
+  
+  CurrentModel <- Models[[i]]
+  PredictionsVector <- c()
+
+  for(k in 1:306){
+    
+    # Ensure the subset is a data frame with one row, not a vector
+    current_row <- TestingSetForCurrent[TestRowsBack:TestRowsFront, , drop = FALSE]
+    
+    TestRowsBack <- TestRowsBack +1000
+    TestRowsFront <- TestRowsFront +1000
+    
+    prediction <- predict(CurrentModel, current_row)
+    PredictionsVector <- c(PredictionsVector,prediction)
+    
+  }
+  BinaryPredictions <- ifelse(PredictionsVector > 1, 1, 0)
+  ComparisonResults <- as.vector(TestResultsForCurrent[1:306000])
+  
+  ComparisonResults <- as.factor(ComparisonResults)
+  BinaryPredictions <- as.factor(BinaryPredictions)
+
+  AccuracyRates <- c(AccuracyRates,mmetric(ComparisonResults,BinaryPredictions,"ACC"))
+  FinalPredictions[, i] <- BinaryPredictions 
+}
+
+  print(AccuracyRates)
+  print(mean(AccuracyRates))
+  print(sd(AccuracyRates))
+  PercentSDFromMean <- (sd(AccuracyRates)/mean(AccuracyRates))*100
+  print(round(PercentSDFromMean,2))
+    
+
+```
+
+## Plot the ROC curve of the ensemble performance on the training set Trained on Clean data
+
+```{r}
+library(caret)
+library(plotROC)
+library(ggplot2)
+
+# plot the confusion matrix
+AverageFinalPredictions <- rowMeans(FinalPredictions)
+BinaryFinalPredictions <- ifelse(as.numeric(AverageFinalPredictions) > 1, 1, 0)
+BinaryFinalPredictions <- as.factor(BinaryFinalPredictions)
+
+
+t(confusionMatrix(BinaryFinalPredictions,ComparisonResults)$table)
+
+conf_matrix<- confusionMatrix(BinaryFinalPredictions,ComparisonResults)$byClass
+
+sensitivity <- conf_matrix["Sensitivity"]
+specificity <- conf_matrix["Specificity"]
+
+# Print results
+print(sensitivity)
+print(specificity)
+
+
+roc_d <- as.data.frame(cbind(BinaryFinalPredictions,ComparisonResults))
+basicplot <- ggplot(roc_d, aes(d = ComparisonResults, m = AverageFinalPredictions)) + geom_roc(n.cuts = 8, labelsize = 4)
+styledplot <- basicplot +
+style_roc(xlab = "False Positive Rate", ylab ="True Positive Rate")
+styledplot
+
+
+```
+
+## Predict on the testing set Trained on Clean Data
+
+```{r}
+
+set.seed(123)
+#options(java.parameters = "-Xmx5g")
+predictions <- matrix(0, nrow = nrow(at_joinTest), ncol = NumberOfSamples)
+
+# predicting percentage default via 1 or 0.
+for (i in 1:NumberOfSamples) {
+  
+    prediction <- predict(Models[[i]], at_joinTest)
+    BinaryPredictions <- ifelse(as.numeric(prediction) > 1, 1, 0)
+    predictions[, i] <- BinaryPredictions 
+}
+
+head(predictions)
+AveragePredictions <- rowMeans(predictions)
+head(AveragePredictions)
+FinalResultsClean <- data.frame(SK_ID_CURR = at_joinTest$sk_id_curr, TARGET = AveragePredictions)
+write.csv(FinalResultsClean, "/Users/cyrussobhani/Documents/Capstone II/FinalResultsClean.csv", row.names = FALSE)
+```
+
+\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~\~
+
+## Format unclean data
+
+```{r}
+
+# convert all character variables to factor in training set
+MLPApplicationTrainFormatted <- data.frame(lapply(ApplicationTrain, function(x) if(is.character(x)) as.factor(x) else x))
+
+# convert all character variables to factor in testing set
+MLPApplicationTestFormatted <- data.frame(lapply(ApplicationTest, function(x) if(is.character(x)) as.factor(x) else x))
+
+# convert the target variable to a factor
+MLPApplicationTrainFormatted$TARGET <- factor(MLPApplicationTrainFormatted$TARGET)
+
+```
+
+## Bagging Step for MLP Ensemble Unclean Data
+
+NOTES: We will use an 11-model ensemble for the MLP modeling. This is because the output needs to be a percentage, and the 11th model will essentially work as a "tie-breaker" in instances where 50% of the models are predicting discrete results. In the following code chunk we define the size of each bag by the size of the minority class, multiplied by 2. We then randomly sample the entire dataset for both classes in a 50/50 split to produce each bag.
+
+```{r}
+set.seed(123)
+
+NumberOfSamples <- 11
+
+# Used the entire size of the minority class
+SamplesPerClass <- min(table(MLPApplicationTrainFormatted$TARGET))
+
+NonDefultClass0 <- MLPApplicationTrainFormatted[MLPApplicationTrainFormatted$TARGET == 0, ]
+DefaultClass1 <- MLPApplicationTrainFormatted[MLPApplicationTrainFormatted$TARGET == 1, ]
+
+BSDatasets <- list()
+
+for (i in 1:NumberOfSamples) {
+  # Sample from each class with replacement
+  boot0 <- NonDefultClass0[sample(1:nrow(NonDefultClass0), SamplesPerClass, replace = TRUE), ]
+  boot1 <- DefaultClass1[sample(1:nrow(DefaultClass1), SamplesPerClass, replace = TRUE), ]
+  
+  # Combine the bootstrapped samples from each class
+  BSDatasets[[i]] <- rbind(boot1, boot0)
+}
+
+# Print the first bootstrapped dataset as an example to test if the bag was generated properly.
+SampleFromList <- BSDatasets[[1]]
+head(SampleFromList)
+```
+
+## Training the Ensemble Unclean Data
+
+NOTES: Here we train each MLP model on its corresponding bag, thus creating 11 different models trained on various randomized subsets of the data with 50/50 weighting of the target variable. For the sake of time in training the models and predicting on them, hyperparameter tuning was decided to be a manual process. This process aimed at creating models that were quick to train and debug, but still had satisfactory accuracy rates. The hyperparameters chosen in the following models are a result of the manual hyperparameter tuning process.
+
+```{r}
+
+# set seed for reproducibility
+set.seed(123) 
+
+#Build the hyperparameters for the MLP model. Changed learning rate to 0.5 from the default of 0.3 to run faster, number of Epochs to 100 (again to train faster), and the structure to 3,3,3.
+l <- 0.5 
+m <- 0.2 
+n <-100 
+h <- "3,3,3" 
+
+MLP <- make_Weka_classifier("weka/classifiers/functions/MultilayerPerceptron") 
+
+# Train an MLP model on each bootstrapped dataset
+Models <- list()
+for(i in 1:NumberOfSamples){
+  CurrentData <- BSDatasets[[i]]
+  TrainInput <- CurrentData[, -2]
+  TargetInput <- CurrentData[, 2] 
+  
+  MLPModel <- MLP(TargetInput~ .,data = TrainInput,control = Weka_control(L=l,M=m, N=n,H=h))
+  Models[[i]] <- MLPModel
+}
+
+```
+
+## Predict on the training data Unclean Data
+
+NOTES:
+
+```{r}
+
+# Define the metrics used to assess model quality
+ConfMatrix <- c("CONF")
+AllMetrics <- c("ALL")
+
+# Create the predictions vector for confusion matrix
+FinalPredictions <- matrix(0, nrow = 307000, ncol = 11)
+
+# Split the training and testing sets
+TestingSetForCurrent <- MLPApplicationTrainFormatted[,-2]
+TestResultsForCurrent <- MLPApplicationTrainFormatted[, 2]
+
+TestRowsBack <- 1 
+TestRowsFront <- 1000 
+
+AccuracyRates <- c()
+
+result_matrix <- matrix(ncol = 11, nrow = 0)
+
+for(i in 1:NumberOfSamples){
+  
+  CurrentModel <- Models[[i]]
+  PredictionsVector <- c()
+
+  for(k in 1:307){
+    
+    # Ensure the subset is a data frame with one row, not a vector
+    current_row <- TestingSetForCurrent[TestRowsBack:TestRowsFront, , drop = FALSE]
+    
+    TestRowsBack <- TestRowsBack +1000
+    TestRowsFront <- TestRowsFront +1000
+    
+    prediction <- predict(CurrentModel, current_row, type="prob")
+    PredictionsVector <- c(PredictionsVector,prediction[,1])
+    
+  }
+  #BinaryPredictions <- ifelse(PredictionsVector > 1, 1, 0)
+  ComparisonResults <- as.vector(TestResultsForCurrent[1:307000])
+  
+  ComparisonResults <- as.factor(ComparisonResults)
+  #BinaryPredictions <- as.factor(BinaryPredictions)
+length(PredictionsVector)
+  #AccuracyRates <- c(AccuracyRates,mmetric(ComparisonResults,BinaryPredictions,"ACC"))
+  FinalPredictions[, i] <- PredictionsVector 
+}
+
+  #print(AccuracyRates)
+  #print(mean(AccuracyRates))
+  #print(sd(AccuracyRates))
+  #PercentSDFromMean <- (sd(AccuracyRates)/mean(AccuracyRates))*100
+  #print(round(PercentSDFromMean,2))
+    
+
+```
+
+## Plot the ROC curve of the ensemble performance on the training set Unclean Data
+
+```{r}
+library(caret)
+library(plotROC)
+library(ggplot2)
+
+# plot the confusion matrix
+AverageFinalPredictions <- rowMeans(FinalPredictions)
+BinaryFinalPredictions <- ifelse(as.numeric(AverageFinalPredictions) > 1, 1, 0)
+BinaryFinalPredictions <- as.factor(BinaryFinalPredictions)
+
+t(confusionMatrix(BinaryFinalPredictions,ComparisonResults)$table)
+
+conf_matrix<- confusionMatrix(BinaryFinalPredictions,ComparisonResults)$byClass
+
+sensitivity <- conf_matrix["Sensitivity"]
+specificity <- conf_matrix["Specificity"]
+
+# Print results
+print(sensitivity)
+print(specificity)
+
+roc_d <- as.data.frame(cbind(BinaryFinalPredictions,ComparisonResults))
+basicplot <- ggplot(roc_d, aes(d = ComparisonResults, m = AverageFinalPredictions)) + geom_roc(n.cuts = 8, labelsize = 4)
+styledplot <- basicplot +
+style_roc(xlab = "False Positive Rate", ylab ="True Positive Rate")
+styledplot
+
+
+```
+
+## Predict on the testing set Unclean Data
+
+```{r}
+
+set.seed(123)
+#options(java.parameters = "-Xmx5g")
+predictions <- matrix(0, nrow = nrow(MLPApplicationTestFormatted), ncol = NumberOfSamples)
+
+# predicting percentage default via 1 or 0.
+for (i in 1:NumberOfSamples) {
+  
+    prediction <- predict(Models[[i]], MLPApplicationTestFormatted)
+    BinaryPredictions <- ifelse(as.numeric(prediction) > 1, 1, 0)
+    predictions[, i] <- BinaryPredictions 
+}
+
+head(predictions)
+AveragePredictions <- rowMeans(predictions)
+head(AveragePredictions)
+FinalResultsClean <- data.frame(SK_ID_CURR = MLPApplicationTestFormatted$SK_ID_CURR, TARGET = AveragePredictions)
+write.csv(FinalResultsClean, "/Users/cyrussobhani/Documents/Capstone II/FinalResultsNotClean.csv", row.names = FALSE)
+```
+
+## ROC curve code
+
+```{r}
+
+library(pROC)
+
+AverageFinalPredictionsROC <- AverageFinalPredictions+1
+
+# Generate ROC curve
+roc_curve <- roc(ComparisonResults, AverageFinalPredictions, levels = rev(levels(ComparisonResults)))
+ 
+# Plot the ROC curve
+plot(roc_curve, col = "blue", lwd = 2, main = "ROC Curve for Neural Network Model")
+ 
+# Calculate AUC
+auc_value <- auc(roc_curve)
+print(paste("AUC:", auc_value))
+
+```
